@@ -19,10 +19,12 @@ input {
     }
 
     mouse {
+        off
         // natural-scroll;
     }
 
     touchpad {
+        off
         tap;
         // natural-scroll;
     }
