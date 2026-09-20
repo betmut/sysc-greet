@@ -36,10 +36,10 @@ gestures {
 }
 
 // Uncomment to hide cursor
- cursor {
+cursor {
     hide-when-typing
     hide-after-inactive-ms 50
- }
+}
 
 layer-rule {
     match namespace="^wallpaper$"
