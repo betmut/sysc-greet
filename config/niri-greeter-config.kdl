@@ -38,7 +38,7 @@ gestures {
 // Uncomment to hide cursor
 cursor {
     hide-when-typing
-    hide-after-inactive-ms 50
+    hide-after-inactive-ms 0
 }
 
 layer-rule {
