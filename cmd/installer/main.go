@@ -77,6 +77,16 @@ var binaryToPackage = map[string]map[string]string{
 	},
 }
 
+// commonBinaryPackages maps binaries whose package name differs from the
+// binary on every distro
+var commonBinaryPackages = map[string]string{
+	"cc": "gcc",
+}
+
+// gslapperBuildTools are the binaries the gSlapper source build needs. Void's
+// base-system ships no C compiler, so cc is checked too.
+var gslapperBuildTools = []string{"cc", "meson", "ninja", "git", "pkg-config"}
+
 // getBinaryPackageName returns the package name for a binary, accounting for distro differences
 func getBinaryPackageName(binary, packageManager string) string {
 	if pmMap, ok := binaryToPackage[packageManager]; ok {
@@ -84,51 +94,10 @@ func getBinaryPackageName(binary, packageManager string) string {
 			return pkg
 		}
 	}
+	if pkg, ok := commonBinaryPackages[binary]; ok {
+		return pkg
+	}
 	return binary // Default: package name matches binary name
-}
-
-// checkPackageInstalled checks if a package is already installed
-func checkPackageInstalled(pkg, packageManager string) bool {
-	var cmd *exec.Cmd
-	switch packageManager {
-	case "pacman":
-		cmd = exec.Command("pacman", "-Q", pkg)
-	case "apt":
-		cmd = exec.Command("dpkg-query", "-W", "-f=${Status}", pkg)
-		output, err := cmd.Output()
-		if err != nil {
-			return false
-		}
-		return strings.Contains(string(output), "install ok installed")
-	case "dnf", "yum", "zypper":
-		cmd = exec.Command("rpm", "-q", pkg)
-	default:
-		return false
-	}
-	return cmd.Run() == nil
-}
-
-// checkPackageExists checks if a package exists in repos (can be installed)
-func checkPackageExists(pkg, packageManager string) bool {
-	var cmd *exec.Cmd
-	switch packageManager {
-	case "pacman":
-		cmd = exec.Command("pacman", "-Si", pkg)
-	case "apt":
-		cmd = exec.Command("apt-cache", "show", pkg)
-	case "dnf":
-		cmd = exec.Command("dnf", "info", pkg)
-	case "yum":
-		cmd = exec.Command("yum", "info", pkg)
-	case "zypper":
-		cmd = exec.Command("zypper", "info", pkg)
-	default:
-		return false
-	}
-	// Suppress output
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run() == nil
 }
 
 // packageCheckResult holds the categorized packages for installation
@@ -225,6 +194,10 @@ type model struct {
 	spinner            spinner.Model
 	errors             []string
 	packageManager     string
+	initSystem         string
+	distroID           string
+	greeterUser        string
+	greeterHome        string
 	greetdInstalled    bool
 	needsGreetd        bool
 	uninstallMode      bool
@@ -234,6 +207,10 @@ type model struct {
 	debugMode          bool     // Show verbose output
 	logFile            *os.File // Installer log file
 	beams              *BeamsTextEffect
+
+	// packageListsRefreshed records that installPackages already updated
+	// the package lists in this run.
+	packageListsRefreshed bool
 }
 
 // greeterCompositor is one row of the compositor picker
@@ -248,7 +225,7 @@ type greeterCompositor struct {
 var greeterCompositors = []greeterCompositor{
 	{name: "niri", label: "Tiling compositor with scrollable workspaces (default)", binaries: []string{"niri"}},
 	{name: "cagebreak", label: "Minimal tiling kiosk", binaries: []string{"cagebreak"}, installable: true},
-	{name: "sway", label: "Stable i3-compatible tiling compositor", binaries: []string{"sway"}},
+	{name: "sway", label: "Stable i3-compatible tiling compositor", binaries: []string{"sway"}, installable: true},
 	{name: "mango", label: "dwl-based tiling compositor (Arch, Debian 13, Ubuntu 26.04, Fedora 43/44)", binaries: []string{"mango"}, installable: true},
 }
 
@@ -349,6 +326,7 @@ func newModel(debugMode bool, logFile *os.File) model {
 		{name: "Check packages", description: "Checking for a distro-managed sysc-greet", execute: checkNoDistroPackage, status: statusPending},
 		{name: "Check dependencies", description: "Checking system dependencies", execute: checkDependencies, status: statusPending},
 		{name: "Install greetd", description: "Installing greetd daemon", execute: installGreetd, optional: false, status: statusPending},
+		{name: "Install login services", description: "Installing elogind, dbus and polkit (non-systemd)", execute: installLoginServices, status: statusPending},
 		{name: "Install kitty", description: "Installing kitty terminal", execute: installKitty, optional: false, status: statusPending},
 		{name: "Install compositor", description: "Installing Wayland compositor", execute: installCompositor, optional: false, status: statusPending},
 		{
@@ -391,6 +369,7 @@ func newModel(debugMode bool, logFile *os.File) model {
 
 	// Detect package manager during initialization (not in async task)
 	detectPackageManager(&m)
+	detectPlatform(&m)
 
 	// Check for pre-selected compositor from environment variable
 	// Preselect the requested compositor when it is available in the picker.
@@ -488,7 +467,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				c := options[m.compositorIndex]
 				m.selectedCompositor = c.name
-				installable := c.installable
+				installable := c.installable || (c.name == "niri" && m.packageManager == "xbps")
 
 				// Installable compositors are installed by installCompositor;
 				// everything else must be present up front
@@ -663,6 +642,9 @@ func (m model) renderCompositorSelect() string {
 	var b strings.Builder
 
 	b.WriteString("Select Wayland compositor:\n\n")
+	if m.packageManager == "emerge" {
+		b.WriteString("Gentoo: select Sway, or a backend you have already installed.\nPortage may compile dependencies; installation can take time.\n\n")
+	}
 
 	for i, comp := range compositorPickerOptions() {
 		prefix := "  "
@@ -916,7 +898,7 @@ func checkPrivileges(m *model) error {
 }
 
 // checkNoDistroPackage stops before any file is touched when a distro package
-// (AUR variant or release .deb/.rpm) owns sysc-greet. Installing or
+// (AUR variant, release .deb/.rpm or native XBPS package) owns sysc-greet. Installing or
 // uninstalling over it leaves the package database pointing at overwritten or
 // deleted files.
 func checkNoDistroPackage(m *model) error {
@@ -947,6 +929,10 @@ func installedDistroPackage(packageManager string) (pkg, remove string) {
 		if exec.Command("rpm", "-q", "sysc-greet").Run() == nil {
 			return "sysc-greet", packageManager + " remove sysc-greet"
 		}
+	case "xbps":
+		if checkPackageInstalled("sysc-greet", packageManager) {
+			return "sysc-greet", "xbps-remove sysc-greet"
+		}
 	}
 	return "", ""
 }
@@ -962,8 +948,10 @@ func detectPackageManager(m *model) {
 		{"apt", "/usr/bin/apt"},
 		{"apt", "/usr/bin/apt-get"}, // Fallback for older Debian/Ubuntu
 		{"dnf", "/usr/bin/dnf"},
-		{"yum", "/usr/bin/yum"},       // Older Fedora/RHEL
-		{"zypper", "/usr/bin/zypper"}, // openSUSE
+		{"yum", "/usr/bin/yum"},           // Older Fedora/RHEL
+		{"zypper", "/usr/bin/zypper"},     // openSUSE
+		{"xbps", "/usr/bin/xbps-install"}, // Void Linux
+		{"emerge", "/usr/bin/emerge"},     // Gentoo
 	}
 
 	for _, pm := range packageManagers {
@@ -993,8 +981,9 @@ func checkDependencies(m *model) error {
 	if _, err := exec.LookPath("go"); err != nil {
 		missing = append(missing, "go")
 	}
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		missing = append(missing, "systemd")
+	// The greeter service needs an init system supported by the installer.
+	if m.initSystem == "" {
+		return fmt.Errorf("no supported init system found (need systemd, runit, or OpenRC)")
 	}
 
 	if len(missing) > 0 {
@@ -1005,74 +994,66 @@ func checkDependencies(m *model) error {
 }
 
 func installGreetd(m *model) error {
-	if m.greetdInstalled {
-		return nil // Already installed - task will succeed silently
-	}
-
-	if m.packageManager == "" {
-		return fmt.Errorf("package manager not detected - install greetd manually")
-	}
-
-	var cmd *exec.Cmd
-	var updateCmd *exec.Cmd
-
-	switch m.packageManager {
-	case "pacman":
-		// Try AUR helper first if available, fall back to pacman
-		if _, err := exec.LookPath("yay"); err == nil {
-			// Use yay for AUR access (greetd might be in AUR)
-			// IMPORTANT: yay must NOT be run as root, but needs sudo internally
-			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
-				// Drop privileges to run yay as the original user
-				// yay will ask for sudo password when needed
-				cmd = exec.Command("su", "-", sudoUser, "-c", "yay -S --noconfirm greetd")
-			} else {
-				// Fallback to pacman if we can't determine non-root user
-				cmd = exec.Command("pacman", "-S", "--noconfirm", "greetd")
-			}
-		} else if _, err := exec.LookPath("paru"); err == nil {
-			// Alternative AUR helper
-			// IMPORTANT: paru must NOT be run as root, but needs sudo internally
-			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "root" && sudoUser != "" {
-				cmd = exec.Command("su", "-", sudoUser, "-c", "paru -S --noconfirm greetd")
-			} else {
-				// Fallback to pacman if we can't determine non-root user
-				cmd = exec.Command("pacman", "-S", "--noconfirm", "greetd")
-			}
-		} else {
-			// Standard pacman (official repos only)
-			cmd = exec.Command("pacman", "-S", "--noconfirm", "greetd")
+	if !m.greetdInstalled {
+		if m.packageManager == "" {
+			return fmt.Errorf("package manager not detected - install greetd manually")
 		}
 
-	case "apt":
-		// Update package list first for apt-based systems
-		updateCmd = exec.Command("apt-get", "update")
-		updateCmd.Run() // Ignore errors, proceed anyway
-		cmd = exec.Command("apt-get", "install", "-y", "greetd")
+		// On Arch, prefer an AUR helper (greetd might be in the AUR). AUR helpers
+		// must NOT run as root, so drop to the invoking user; the helper asks for
+		// sudo itself. Without a non-root user, fall back to pacman.
+		var aurCmd *exec.Cmd
+		if m.packageManager == "pacman" {
+			for _, helper := range []string{"yay", "paru"} {
+				if _, err := exec.LookPath(helper); err != nil {
+					continue
+				}
+				if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
+					aurCmd = exec.Command("su", "-", sudoUser, "-c", helper+" -S --noconfirm greetd")
+				}
+				break
+			}
+		}
 
-	case "dnf":
-		cmd = exec.Command("dnf", "install", "-y", "greetd")
-
-	case "yum":
-		cmd = exec.Command("yum", "install", "-y", "greetd")
-
-	case "zypper":
-		cmd = exec.Command("zypper", "install", "-y", "greetd")
-
-	default:
-		return fmt.Errorf("unsupported package manager '%s' - install greetd manually", m.packageManager)
+		var err error
+		if aurCmd != nil {
+			err = runCommand("Install greetd", aurCmd, m)
+		} else {
+			err = installPackages(m, "Install greetd", "greetd")
+		}
+		if err != nil {
+			return fmt.Errorf("failed to install greetd (try: manual installation)")
+		}
 	}
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to install greetd (try: manual installation)")
+	if m.initSystem == initOpenRC {
+		if err := installPackages(m, "Install display-manager-init", "display-manager-init"); err != nil {
+			return fmt.Errorf("failed to install display-manager-init for OpenRC: %w", err)
+		}
 	}
 
 	return nil
 }
 
+// installLoginServices installs elogind, dbus and polkit where no
+// systemd-logind provides the seat and the power actions.
+func installLoginServices(m *model) error {
+	packages := loginServicePackages(m.initSystem)
+	if len(packages) == 0 {
+		return nil
+	}
+	if err := installPackages(m, "Install login services", packages...); err != nil {
+		return fmt.Errorf("failed to install %s - the greeter needs them for its seat and power menu", strings.Join(packages, ", "))
+	}
+	return nil
+}
+
 func installKitty(m *model) error {
-	// Check if already installed
-	if _, err := exec.LookPath("kitty"); err == nil {
+	packages := []string{"kitty"}
+	if m.packageManager == "xbps" {
+		// Void's kitty package has no font dependency, even on a minimal host.
+		packages = append(packages, "dejavu-fonts-ttf")
+	} else if _, err := exec.LookPath("kitty"); err == nil {
 		return nil // Already installed
 	}
 
@@ -1080,29 +1061,7 @@ func installKitty(m *model) error {
 		return fmt.Errorf("package manager not detected - install kitty manually")
 	}
 
-	var cmd *exec.Cmd
-
-	switch m.packageManager {
-	case "pacman":
-		cmd = exec.Command("pacman", "-S", "--noconfirm", "kitty")
-
-	case "apt":
-		cmd = exec.Command("apt-get", "install", "-y", "kitty")
-
-	case "dnf":
-		cmd = exec.Command("dnf", "install", "-y", "kitty")
-
-	case "yum":
-		cmd = exec.Command("yum", "install", "-y", "kitty")
-
-	case "zypper":
-		cmd = exec.Command("zypper", "install", "-y", "kitty")
-
-	default:
-		return fmt.Errorf("unsupported package manager '%s' - install kitty manually", m.packageManager)
-	}
-
-	if err := cmd.Run(); err != nil {
+	if err := installPackages(m, "Install kitty", packages...); err != nil {
 		return fmt.Errorf("failed to install kitty")
 	}
 
@@ -1137,22 +1096,10 @@ func ensureSocat(m *model) error {
 	if _, err := exec.LookPath("socat"); err == nil {
 		return nil
 	}
-	var cmd *exec.Cmd
-	switch m.packageManager {
-	case "pacman":
-		cmd = exec.Command("pacman", "-S", "--noconfirm", "socat")
-	case "apt":
-		cmd = exec.Command("apt-get", "install", "-y", "socat")
-	case "dnf":
-		cmd = exec.Command("dnf", "install", "-y", "socat")
-	case "yum":
-		cmd = exec.Command("yum", "install", "-y", "socat")
-	case "zypper":
-		cmd = exec.Command("zypper", "install", "-y", "socat")
-	default:
+	if installCommand(m.packageManager, "socat") == nil {
 		return fmt.Errorf("socat is required for cagebreak — install it manually")
 	}
-	if err := cmd.Run(); err != nil {
+	if err := installPackages(m, "Install socat", "socat"); err != nil {
 		return fmt.Errorf("failed to install socat (cagebreak cannot quit after login without it)")
 	}
 	return nil
@@ -1232,7 +1179,7 @@ func parseOSRelease(data string) (id, version string) {
 	fields := map[string]string{}
 	for _, line := range strings.Split(data, "\n") {
 		if k, v, ok := strings.Cut(line, "="); ok {
-			fields[k] = strings.Trim(v, `"`)
+			fields[k] = strings.Trim(v, `"'`)
 		}
 	}
 	like := strings.Fields(fields["ID_LIKE"])
@@ -1379,20 +1326,7 @@ func buildCagebreakFromSource(m *model) error {
 		deps = append(deps, wlrootsDev)
 	}
 
-	var cmd *exec.Cmd
-	switch m.packageManager {
-	case "apt":
-		cmd = exec.Command("apt-get", append([]string{"install", "-y"}, deps...)...)
-	case "dnf":
-		cmd = exec.Command("dnf", append([]string{"install", "-y"}, deps...)...)
-	case "yum":
-		cmd = exec.Command("yum", append([]string{"install", "-y"}, deps...)...)
-	case "zypper":
-		cmd = exec.Command("zypper", append([]string{"install", "-y"}, deps...)...)
-	}
-	if cmd != nil {
-		runCommand("Install cagebreak build deps", cmd, m) // Best effort; verified below
-	}
+	installPackages(m, "Install cagebreak build deps", deps...) // Best effort; verified below
 
 	for _, tool := range []string{"meson", "ninja", "git", "pkg-config"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -1441,7 +1375,7 @@ func installMango(m *model) error {
 	if !compositorInstalled("mango") {
 		switch {
 		case m.packageManager == "pacman":
-			if err := runCommand("Install mangowm", exec.Command("pacman", "-S", "--noconfirm", "mangowm"), m); err != nil {
+			if err := installPackages(m, "Install mangowm", "mangowm"); err != nil {
 				return fmt.Errorf("failed to install mangowm - install it manually: pacman -S mangowm")
 			}
 		case mangoArtifact() != "":
@@ -1479,7 +1413,11 @@ func installCompositor(m *model) error {
 		return fmt.Errorf("package manager not detected - install %s manually", m.selectedCompositor)
 	}
 
+	// cmd carries a special install path (an AUR helper); pkg names a plain
+	// package for the detected package manager
 	var cmd *exec.Cmd
+	var pkg string
+	var err error
 
 	// Map compositor names to package names per distro
 	switch m.packageManager {
@@ -1504,9 +1442,9 @@ func installCompositor(m *model) error {
 				return fmt.Errorf("niri requires AUR helper (yay/paru) - install manually")
 			}
 		case "hyprland":
-			cmd = exec.Command("pacman", "-S", "--noconfirm", "hyprland")
+			pkg = "hyprland"
 		case "sway":
-			cmd = exec.Command("pacman", "-S", "--noconfirm", "sway")
+			pkg = "sway"
 		case "cagebreak":
 			return installCagebreakArch()
 		}
@@ -1519,7 +1457,7 @@ func installCompositor(m *model) error {
 		case "hyprland":
 			return fmt.Errorf("hyprland not in standard apt repos - see https://hyprland.org for installation")
 		case "sway":
-			cmd = exec.Command("apt-get", "install", "-y", "sway")
+			pkg = "sway"
 		case "cagebreak":
 			return installCagebreakPrebuilt(m)
 		}
@@ -1532,7 +1470,7 @@ func installCompositor(m *model) error {
 		case "hyprland":
 			return fmt.Errorf("hyprland not in standard dnf repos - see https://hyprland.org for installation")
 		case "sway":
-			cmd = exec.Command("dnf", "install", "-y", "sway")
+			pkg = "sway"
 		case "cagebreak":
 			return installCagebreakPrebuilt(m)
 		}
@@ -1541,7 +1479,7 @@ func installCompositor(m *model) error {
 		// RHEL/CentOS
 		switch m.selectedCompositor {
 		case "sway":
-			cmd = exec.Command("yum", "install", "-y", "sway")
+			pkg = "sway"
 		default:
 			return fmt.Errorf("%s not available via yum - install manually", m.selectedCompositor)
 		}
@@ -1552,10 +1490,10 @@ func installCompositor(m *model) error {
 		case "hyprland":
 			return fmt.Errorf("hyprland may require Tumbleweed or manual install")
 		case "sway":
-			cmd = exec.Command("zypper", "install", "-y", "sway")
+			pkg = "sway"
 		case "cagebreak":
 			// Packaged in Tumbleweed; source build covers anything else
-			if err := exec.Command("zypper", "install", "-y", "cagebreak").Run(); err != nil {
+			if err := installPackages(m, "Install cagebreak", "cagebreak"); err != nil {
 				return buildCagebreakFromSource(m)
 			}
 			return nil
@@ -1563,15 +1501,39 @@ func installCompositor(m *model) error {
 			return fmt.Errorf("%s may not be in zypper repos - install manually", m.selectedCompositor)
 		}
 
+	case "xbps":
+		// Void Linux
+		switch m.selectedCompositor {
+		case "niri":
+			pkg = "niri"
+		case "sway":
+			pkg = "sway"
+		case "cagebreak":
+			pkg = "cagebreak"
+		default:
+			return fmt.Errorf("%s is not in the Void Linux repos - install manually", m.selectedCompositor)
+		}
+
+	case "emerge":
+		// Gentoo's main tree provides Sway; other compositors can be installed
+		// separately and the installer will use them when already present.
+		if m.selectedCompositor != "sway" {
+			return fmt.Errorf("%s is not available through the Gentoo installer - install it manually", m.selectedCompositor)
+		}
+		pkg = "sway"
+
 	default:
 		return fmt.Errorf("unsupported package manager '%s' - install %s manually", m.packageManager, m.selectedCompositor)
 	}
 
-	if cmd == nil {
+	if cmd != nil {
+		err = runCommand("Install "+m.selectedCompositor, cmd, m)
+	} else if pkg != "" {
+		err = installPackages(m, "Install "+m.selectedCompositor, pkg)
+	} else {
 		return fmt.Errorf("%s installation command not configured", m.selectedCompositor)
 	}
-
-	if err := cmd.Run(); err != nil {
+	if err != nil {
 		return fmt.Errorf("failed to install %s - you may need to install manually", m.selectedCompositor)
 	}
 
@@ -1663,6 +1625,35 @@ func getGStreamerDeps(packageManager string) []string {
 			"wayland-devel",
 			"wayland-protocols-devel",
 		}
+	case "xbps":
+		// Void Linux - the build needs the development packages. The good
+		// plugins ship no -devel subpackage, so the main package is listed.
+		return []string{
+			"gstreamer1-devel",
+			"gst-plugins-base1-devel",
+			"gst-plugins-good1",
+			"gst-plugins-bad1-devel",
+			"wayland-devel",
+			"wayland-protocols",
+			"mesa",
+			"pkg-config",
+		}
+	case "emerge":
+		return []string{
+			"media-libs/gstreamer",
+			"media-libs/gst-plugins-base[egl,wayland]",
+			"media-libs/gst-plugins-good",
+			"media-libs/gst-plugins-bad",
+			"media-plugins/gst-plugins-libpng",
+			"media-plugins/gst-plugins-jpeg",
+			"media-plugins/gst-plugins-webp",
+			"media-plugins/gst-plugins-gdkpixbuf",
+			"media-plugins/gst-plugins-libav",
+			"dev-libs/wayland",
+			"dev-libs/wayland-protocols",
+			"media-libs/mesa",
+			"virtual/pkgconfig",
+		}
 	default:
 		return []string{}
 	}
@@ -1714,30 +1705,7 @@ func installGStreamerDeps(m *model) error {
 		}
 	}
 
-	var cmd *exec.Cmd
-	switch m.packageManager {
-	case "pacman":
-		args := append([]string{"-S", "--noconfirm", "--needed"}, result.toInstall...)
-		cmd = exec.Command("pacman", args...)
-	case "apt":
-		// Update first
-		exec.Command("apt-get", "update").Run()
-		args := append([]string{"install", "-y"}, result.toInstall...)
-		cmd = exec.Command("apt-get", args...)
-	case "dnf":
-		args := append([]string{"install", "-y"}, result.toInstall...)
-		cmd = exec.Command("dnf", args...)
-	case "yum":
-		args := append([]string{"install", "-y"}, result.toInstall...)
-		cmd = exec.Command("yum", args...)
-	case "zypper":
-		args := append([]string{"install", "-y"}, result.toInstall...)
-		cmd = exec.Command("zypper", args...)
-	default:
-		return fmt.Errorf("unsupported package manager for GStreamer deps")
-	}
-
-	if err := runCommand("Install GStreamer deps", cmd, m); err != nil {
+	if err := installPackages(m, "Install GStreamer deps", result.toInstall...); err != nil {
 		return fmt.Errorf("failed to install GStreamer dependencies: %s", strings.Join(result.toInstall, ", "))
 	}
 	return nil
@@ -1755,9 +1723,8 @@ func buildGslapperFromSource(m *model) error {
 	updateSubTaskStatus(m, 2, statusComplete)
 
 	// Check for build tools
-	buildTools := []string{"meson", "ninja", "git", "pkg-config"}
 	missingBinaries := []string{}
-	for _, tool := range buildTools {
+	for _, tool := range gslapperBuildTools {
 		if _, err := exec.LookPath(tool); err != nil {
 			missingBinaries = append(missingBinaries, tool)
 		}
@@ -1776,34 +1743,15 @@ func buildGslapperFromSource(m *model) error {
 				strings.Join(missingBinaries, ", "), strings.Join(missingPackages, ", "))
 		}
 
-		var cmd *exec.Cmd
-		switch m.packageManager {
-		case "pacman":
-			args := append([]string{"-S", "--noconfirm", "--needed"}, missingPackages...)
-			cmd = exec.Command("pacman", args...)
-		case "apt":
-			args := append([]string{"install", "-y"}, missingPackages...)
-			cmd = exec.Command("apt-get", args...)
-		case "dnf":
-			args := append([]string{"install", "-y"}, missingPackages...)
-			cmd = exec.Command("dnf", args...)
-		case "yum":
-			args := append([]string{"install", "-y"}, missingPackages...)
-			cmd = exec.Command("yum", args...)
-		case "zypper":
-			args := append([]string{"install", "-y"}, missingPackages...)
-			cmd = exec.Command("zypper", args...)
-		default:
+		if installCommand(m.packageManager, missingPackages...) == nil {
 			updateSubTaskStatus(m, 3, statusFailed)
 			return fmt.Errorf("missing build tools: %s", strings.Join(missingBinaries, ", "))
 		}
-		if cmd != nil {
-			runCommand("Install build tools", cmd, m) // Best effort
-		}
+		installPackages(m, "Install build tools", missingPackages...) // Best effort
 	}
 
 	// Verify build tools are now available
-	for _, tool := range []string{"meson", "ninja", "git"} {
+	for _, tool := range []string{"cc", "meson", "ninja", "git"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			updateSubTaskStatus(m, 3, statusFailed)
 			return fmt.Errorf("missing build tool: %s", tool)
@@ -1970,6 +1918,10 @@ func copyDirContents(src, dst string) error {
 }
 
 func setupCache(m *model) error {
+	if m.greeterUser == "" {
+		resolveGreeterAccount(m)
+	}
+
 	account := os.Getenv("SYSC_THEME_USER")
 	if account == "" {
 		account = os.Getenv("SUDO_USER")
@@ -1982,11 +1934,10 @@ func setupCache(m *model) error {
 	// shader caches, and sysc-greet preferences.
 	dirs := []string{
 		"/var/cache/sysc-greet",
-		"/var/lib/greeter/Pictures/wallpapers",
-		"/var/lib/greeter/.cache",
-		"/var/lib/greeter/.config",
-		"/var/lib/greeter/.local/state",
-		"/tmp/greeter-cache",
+		filepath.Join(m.greeterHome, "Pictures/wallpapers"),
+		filepath.Join(m.greeterHome, ".cache"),
+		filepath.Join(m.greeterHome, ".config"),
+		filepath.Join(m.greeterHome, ".local/state"),
 	}
 	for _, dir := range dirs {
 		if err := exec.Command("mkdir", "-p", dir).Run(); err != nil {
@@ -1994,7 +1945,7 @@ func setupCache(m *model) error {
 		}
 	}
 
-	if err := exec.Command("chmod", "755", "/var/lib/greeter").Run(); err != nil {
+	if err := exec.Command("chmod", "755", m.greeterHome).Run(); err != nil {
 		return fmt.Errorf("permissions change failed")
 	}
 
@@ -2002,25 +1953,29 @@ func setupCache(m *model) error {
 	// FIXED 2025-10-15 - Add render group for modern Intel/AMD iGPU support
 	// Modern Linux uses 'render' group for /dev/dri/renderD* (non-privileged GPU access)
 	// Both 'video' and 'render' groups needed for laptop iGPU compatibility
-	cmd := exec.Command("id", "greeter")
-	if err := cmd.Run(); err != nil {
-		// User doesn't exist - create with video,render,input groups
-		cmd = exec.Command("useradd", "-M", "-d", "/var/lib/greeter", "-G", "video,render,input", "-s", "/usr/bin/nologin", "greeter")
+	groups := greeterGroups()
+	if !userExists(m.greeterUser) {
+		// User doesn't exist - create with the groups the greeter needs
+		cmd := exec.Command("useradd", "-M", "-d", m.greeterHome, "-G", groups, "-s", "/usr/bin/nologin", m.greeterUser)
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("greeter user creation failed")
 		}
 	} else {
 		// User exists - ensure they have required groups and a writable home.
 		// CRITICAL: This fixes laptops where greeter user exists but lacks render group
-		if err := exec.Command("usermod", "-d", "/var/lib/greeter", "-aG", "video,render,input", "greeter").Run(); err != nil {
+		if err := exec.Command("usermod", "-d", m.greeterHome, "-aG", groups, m.greeterUser).Run(); err != nil {
 			return fmt.Errorf("greeter user update failed")
 		}
 	}
 
 	// Set ownership
-	paths := []string{"/var/cache/sysc-greet", "/var/lib/greeter", "/tmp/greeter-cache"}
+	owner := m.greeterUser
+	if groupExists(m.greeterUser) {
+		owner = m.greeterUser + ":" + m.greeterUser
+	}
+	paths := []string{"/var/cache/sysc-greet", m.greeterHome}
 	for _, path := range paths {
-		if err := exec.Command("chown", "-R", "greeter:greeter", path).Run(); err != nil {
+		if err := exec.Command("chown", "-R", owner, path).Run(); err != nil {
 			return fmt.Errorf("ownership change failed for %s", path)
 		}
 	}
@@ -2029,6 +1984,10 @@ func setupCache(m *model) error {
 }
 
 func configureGreetd(m *model) error {
+	if m.greeterUser == "" {
+		resolveGreeterAccount(m)
+	}
+
 	var compositorConfig string
 	var greetdCommand string
 	var configPath string
@@ -2163,8 +2122,10 @@ exec cd /var/lib/greeter && env HOME=/var/lib/greeter XDG_CACHE_HOME=/var/lib/gr
 			return fmt.Errorf("mango greeter config missing: %v", err)
 		}
 		compositorConfig = string(data)
-		if err := exec.Command("install", "-Dm755", "config/mango-greeter-session.sh", "/etc/greetd/mango-greeter-session.sh").Run(); err != nil {
-			return fmt.Errorf("mango greeter session script install failed")
+		// The session script hardcodes the greeter home, so it has to be
+		// rewritten for the account this system uses.
+		if err := writeGreeterScript("config/mango-greeter-session.sh", "/etc/greetd/mango-greeter-session.sh", m.greeterUser, m.greeterHome); err != nil {
+			return fmt.Errorf("mango greeter session script install failed: %w", err)
 		}
 		configPath = "/etc/greetd/mango-greeter-config.conf"
 		greetdCommand = "mango -c /etc/greetd/mango-greeter-config.conf -s /etc/greetd/mango-greeter-session.sh"
@@ -2174,22 +2135,23 @@ exec cd /var/lib/greeter && env HOME=/var/lib/greeter XDG_CACHE_HOME=/var/lib/gr
 	}
 
 	// Write compositor config
+	compositorConfig = substituteGreeterPaths(compositorConfig, m.greeterUser, m.greeterHome)
 	if err := os.WriteFile(configPath, []byte(compositorConfig), 0644); err != nil {
 		return fmt.Errorf("compositor config write failed")
 	}
 
 	// Write greetd config
 	greetdConfig := fmt.Sprintf(`[terminal]
-vt = 1
+vt = %d
 
 [default_session]
 command = "%s"
-user = "greeter"
+user = "%s"
 
 [initial_session]
 command = "%s"
-user = "greeter"
-`, greetdCommand, greetdCommand)
+user = "%s"
+`, greeterVTForInit(m.initSystem), greetdCommand, m.greeterUser, greetdCommand, m.greeterUser)
 
 	// Keep the previous config when it differs, as the AUR .install scripts do
 	if old, err := os.ReadFile("/etc/greetd/config.toml"); err == nil && string(old) != greetdConfig {
@@ -2217,6 +2179,7 @@ user = "greeter"
 	if err := os.MkdirAll("/etc/polkit-1/rules.d", 0755); err != nil {
 		return fmt.Errorf("polkit rules directory creation failed")
 	}
+	polkitRule = substituteGreeterPaths(polkitRule, m.greeterUser, m.greeterHome)
 	if err := os.WriteFile("/etc/polkit-1/rules.d/85-greeter.rules", []byte(polkitRule), 0644); err != nil {
 		return fmt.Errorf("polkit rule write failed")
 	}
@@ -2225,30 +2188,51 @@ user = "greeter"
 }
 
 func enableService(m *model) error {
-	// Remove existing display-manager.service symlink
-	symlinkPath := "/etc/systemd/system/display-manager.service"
-	if _, err := os.Lstat(symlinkPath); err == nil {
-		os.Remove(symlinkPath)
-	}
+	switch m.initSystem {
+	case initRunit:
+		return enableRunitGreetd("/")
+	case initOpenRC:
+		return enableOpenRCGreetd("/")
+	case initSystemd:
+		// Remove existing display-manager.service symlink
+		symlinkPath := "/etc/systemd/system/display-manager.service"
+		if _, err := os.Lstat(symlinkPath); err == nil {
+			os.Remove(symlinkPath)
+		}
 
-	// Enable greetd
-	cmd := exec.Command("systemctl", "enable", "greetd.service")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("service enable failed")
-	}
+		// Enable greetd
+		cmd := exec.Command("systemctl", "enable", "greetd.service")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("service enable failed")
+		}
 
-	return nil
+		return nil
+	default:
+		return fmt.Errorf("no supported init system detected (need systemd, runit, or OpenRC)")
+	}
 }
 
 // Uninstall functions
 
 func disableService(m *model) error {
-	// Disable greetd service
-	if err := exec.Command("systemctl", "disable", "greetd.service").Run(); err != nil {
-		// Not a critical error if it's already disabled
+	switch m.initSystem {
+	case initRunit:
+		return disableRunitGreetd()
+	case initOpenRC:
+		// OpenRC reports an error if display-manager was not enabled; that is
+		// harmless during uninstall, as with systemd's disable command.
+		_ = exec.Command("rc-update", "del", "display-manager", "default").Run()
+		return nil
+	case initSystemd:
+		// Disable greetd service
+		if err := exec.Command("systemctl", "disable", "greetd.service").Run(); err != nil {
+			// Not a critical error if it's already disabled
+			return nil
+		}
+		return nil
+	default:
 		return nil
 	}
-	return nil
 }
 
 func removeBinary(m *model) error {

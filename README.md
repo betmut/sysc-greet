@@ -23,7 +23,7 @@ One-line installer that works on most Linux distributions:
 curl -fsSL https://raw.githubusercontent.com/Nomadcxx/sysc-greet/master/install.sh | sudo bash
 ```
 
-The installer automatically detects your package manager and works on Arch Linux, Debian/Ubuntu, Fedora, and openSUSE. It'll handle greeter backend selection, install dependencies, and set everything up for you.
+The installer detects the package manager on Arch Linux, Debian/Ubuntu, Fedora, openSUSE, Void Linux, and Gentoo. It installs the greeter dependencies and configures the selected backend.
 
 ### Build from Source
 
@@ -32,11 +32,32 @@ If you want to build it yourself, just clone the repo and run the installer:
 ```bash
 git clone https://github.com/Nomadcxx/sysc-greet
 cd sysc-greet
-go run ./cmd/installer/
+sudo go run ./cmd/installer/
 ```
 
 The installer walks you through compositor selection and configuration.
 Set `SYSC_COMPOSITOR=hyprland` before running the installer to show the Hyprland 0.55+ option.
+
+### Void Linux
+
+Native XBPS packages are available for x86_64 glibc and musl. Download sysc-greet and gSlapper for the same architecture:
+
+| Architecture | sysc-greet 1.3.0 | gSlapper 1.5.2 |
+|---|---|---|
+| x86_64 (glibc) | [Download](https://github.com/Nomadcxx/sysc-greet/releases/download/v1.3.0/sysc-greet-1.3.0_1.x86_64.xbps) | [Download](https://github.com/Nomadcxx/gSlapper/releases/download/v1.5.2/gslapper-1.5.2_1.x86_64.xbps) |
+| x86_64 (musl) | [Download](https://github.com/Nomadcxx/sysc-greet/releases/download/v1.3.0/sysc-greet-1.3.0_1.x86_64-musl.xbps) | [Download](https://github.com/Nomadcxx/gSlapper/releases/download/v1.5.2/gslapper-1.5.2_1.x86_64-musl.xbps) |
+
+Follow the [Void Linux guide](https://nomadcxx.github.io/sysc-greet/docs/getting-started/void-linux/#native-xbps-packages) to verify checksums, install the packages and configure greetd. These are upstream release packages; [submission to Void's repositories](https://github.com/void-linux/void-packages/pull/63202) is pending.
+
+Release CI builds and install-checks both XBPS variants and publishes them with source archives and `SHA256SUMS-void`.
+
+The Go installer also supports XBPS and runit. The tested setup uses elogind, D-Bus and polkit. Void glibc x86_64 VM tests passed desktop login, reboot and shutdown.
+
+### Gentoo
+
+The installer supports Portage and Gentoo's native OpenRC `display-manager` service. Use Sway from the main tree, or install another backend before selecting it. The amd64 desktop/OpenRC VM passed clean installation, login/logout, reboot and shutdown on VT 7.
+
+See the [Gentoo guide](https://nomadcxx.github.io/sysc-greet/docs/getting-started/gentoo/) for prerequisites, USE settings and recovery commands. Gentoo systemd and minimal profiles have not received VM validation.
 
 ### Arch Linux (AUR)
 
@@ -90,11 +111,15 @@ If you're on NixOS, add sysc-greet to your flake:
 
 **configuration.nix:**
 ```nix
+{ lib, ... }:
 {
   services.sysc-greet = {
     enable = true;
     compositor = "niri";  # or "cagebreak", "sway", "mango", "hyprland" (0.55+)
   };
+
+  # Required for the CC BY-NC model assets included through sysc-Go.
+  nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "sysc-greet" ];
 
   # Optional: Set initial session for auto-login
   services.sysc-greet.settings.initial_session = {
@@ -203,7 +228,9 @@ For detailed docs, configuration guides, troubleshooting, and usage instructions
 
 ## License
 
-The sysc-greet source is GPL-3.0-only. Bundled animation code is MIT; model data uses CC0, CC BY, CC BY-NC, CC BY-SA, and CC BY-NC-SA licenses. The CC BY-NC restrictions apply to the models marked that way in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), which lists all bundled third-party code and model data.
+sysc-greet's own source code is licensed under [GPL-3.0-only](LICENSE).
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for notices covering third-party code and model assets supplied through sysc-Go.
 
 ---
 

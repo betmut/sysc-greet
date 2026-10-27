@@ -8,7 +8,6 @@ import (
 	"image/color"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -47,7 +46,10 @@ var dataDir = "/usr/share/sysc-greet"
 // CHANGED 2025-10-06 - Add debug logging to file
 var debugLog *log.Logger
 
-func initDebugLog() {
+func initDebugLog(enabled bool) {
+	if !enabled {
+		return
+	}
 	// Try persistent location first ($HOME/.cache/sysc-greet/debug.log)
 	// Falls back to /tmp/ if home dir unavailable
 	logPaths := []string{"/tmp/sysc-greet-debug.log"}
@@ -615,9 +617,11 @@ func cycleAnimSpeed(current string) string {
 // theme colors. Call after applyTheme.
 func (m *model) applyInputTheme() {
 	for _, in := range []*textinput.Model{&m.usernameInput, &m.passwordInput} {
-		in.Styles.Focused.Prompt = lipgloss.NewStyle().Foreground(Primary).Bold(true)
-		in.Styles.Focused.Text = lipgloss.NewStyle().Foreground(FgPrimary)
-		in.Styles.Focused.Placeholder = lipgloss.NewStyle().Foreground(FgMuted).Italic(true)
+		for _, styles := range []*textinput.StyleState{&in.Styles.Focused, &in.Styles.Blurred} {
+			styles.Prompt = lipgloss.NewStyle().Foreground(Primary).Bold(true)
+			styles.Text = lipgloss.NewStyle().Foreground(FgPrimary)
+			styles.Placeholder = lipgloss.NewStyle().Foreground(FgMuted).Italic(true)
+		}
 	}
 }
 
@@ -1390,23 +1394,15 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				fmt.Println("Test mode: Would reboot system")
 				return m, tea.Quit
 			}
-			// FIXED 2026-03-23 - Don't quit greeter after issuing reboot
-			// systemd 260+ kills all processes in session scope on greeter exit,
-			// which races with the reboot command. Stay alive and let reboot kill us.
-			exec.Command("systemctl", "reboot").Start()
 			m.mode = ModeLoading
-			return m, nil
+			return m, requestPower(action, "reboot")
 		case "Shutdown":
 			if m.config.TestMode {
 				fmt.Println("Test mode: Would shutdown system")
 				return m, tea.Quit
 			}
-			// FIXED 2026-03-23 - Don't quit greeter after issuing shutdown
-			// systemd 260+ kills all processes in session scope on greeter exit,
-			// which races with the poweroff command. Stay alive and let shutdown kill us.
-			exec.Command("systemctl", "poweroff").Start()
 			m.mode = ModeLoading
-			return m, nil
+			return m, requestPower(action, "poweroff")
 		case "Cancel":
 			m.mode = ModeLogin
 			m.focusState = FocusUsername
@@ -1414,6 +1410,15 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.passwordInput.Blur()
 			cmds = append(cmds, textinput.Blink)
 		}
+
+	case powerFailedMsg:
+		m.errorMessage = fmt.Sprintf("%s failed: %s", msg.action, msg.reason)
+		m.borderFailureAt = time.Now()
+		m.mode = ModeLogin
+		m.focusState = FocusUsername
+		m.usernameInput.Focus()
+		m.passwordInput.Blur()
+		return m, textinput.Blink
 
 	case authSuccessMsg:
 		m.clearAuthPrompt()
@@ -1639,7 +1644,10 @@ func (m model) handleKeyInput(msg tea.KeyMsg) (model, tea.Cmd) {
 		case ModeMenu:
 			// CHANGED 2025-09-30 - Add escape from menu
 			m.mode = ModeLogin
-			return m, nil
+			m.focusState = FocusUsername
+			m.usernameInput.Focus()
+			m.passwordInput.Blur()
+			return m, textinput.Blink
 		// Add escape handling for submenus
 		case ModeThemesSubmenu, ModeBordersSubmenu, ModeBackgroundsSubmenu, ModeWallpaperSubmenu, ModeASCIIEffectsSubmenu:
 			// Go back to main menu
@@ -2131,7 +2139,10 @@ func (m model) handleKeyInput(msg tea.KeyMsg) (model, tea.Cmd) {
 			switch selectedOption {
 			case "Close Menu":
 				m.mode = ModeLogin
-				return m, nil
+				m.focusState = FocusUsername
+				m.usernameInput.Focus()
+				m.passwordInput.Blur()
+				return m, textinput.Blink
 			case "Themes":
 				newModel, cmd := m.navigateToThemesSubmenu()
 				return newModel.(model), cmd
@@ -3087,7 +3098,7 @@ func main() {
 	}
 
 	// CHANGED 2025-10-06 - Initialize debug logging
-	initDebugLog()
+	initDebugLog(config.Debug)
 	logDebug("=== sysc-greet started ===")
 	logDebug("Version: sysc-greet greeter")
 	logDebug("Test mode: %v", config.TestMode)

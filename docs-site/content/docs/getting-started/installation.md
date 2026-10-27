@@ -20,11 +20,30 @@ The interactive installer will prompt you to:
 
 > Set `SYSC_COMPOSITOR=hyprland` when running the installer to opt into Hyprland 0.55+. The installer then shows its Lua based backend option. Check startup, login, and quit on the target machine before enabling greetd.
 
+### Void Linux
+
+Void supports native XBPS release packages for x86_64 glibc and musl, plus the Go installer. Both use runit, elogind, D-Bus and polkit. See the [Void Linux guide](../getting-started/void-linux) for package downloads, greetd setup and existing seatd/turnstile configurations.
+
+```bash
+sudo SYSC_COMPOSITOR=cagebreak go run ./cmd/installer/
+```
+
+### Gentoo
+
+Use the installer with Portage and the native OpenRC `display-manager` service. The tested route uses Sway, elogind, D-Bus and polkit on an amd64 desktop/OpenRC profile:
+
+```bash
+# From a root shell in the cloned repository:
+SYSC_COMPOSITOR=sway go run ./cmd/installer/
+```
+
+See the [Gentoo guide](../getting-started/gentoo) for graphics and USE prerequisites, build times and recovery. The installer leaves keywords and USE settings to you.
+
 ## Manual Build
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - greetd
 - Wayland backend: Niri (default), Cagebreak, Sway, Mango, or Hyprland 0.55+ (sysc-compositor: experimental)
 - kitty (terminal emulator)
@@ -45,7 +64,7 @@ sudo install -Dm755 sysc-greet /usr/local/bin/sysc-greet
 The installer handles compositor configuration automatically:
 
 ```bash
-go run ./cmd/installer/
+sudo go run ./cmd/installer/
 ```
 
 ## Arch Linux (AUR)
@@ -78,8 +97,8 @@ Download pre-built packages from [GitHub Releases](https://github.com/Nomadcxx/s
 ### Debian/Ubuntu (.deb)
 
 ```bash
-wget https://github.com/Nomadcxx/sysc-greet/releases/download/v1.2.0/sysc-greet_1.2.0_amd64.deb
-sudo apt install ./sysc-greet_1.2.0_amd64.deb
+wget https://github.com/Nomadcxx/sysc-greet/releases/download/v1.3.0/sysc-greet_1.3.0_amd64.deb
+sudo apt install ./sysc-greet_1.3.0_amd64.deb
 ```
 
 The package will:
@@ -93,17 +112,21 @@ The package will:
 ### Fedora (.rpm)
 
 ```bash
-wget https://github.com/Nomadcxx/sysc-greet/releases/download/v1.2.0/sysc-greet-1.2.0-1.x86_64.rpm
-sudo dnf install ./sysc-greet-1.2.0-1.x86_64.rpm
+wget https://github.com/Nomadcxx/sysc-greet/releases/download/v1.3.0/sysc-greet-1.3.0-1.x86_64.rpm
+sudo dnf install ./sysc-greet-1.3.0-1.x86_64.rpm
 ```
 
 After installation, **reboot** your system to see sysc-greet.
 
 The releases page also carries cagebreak `.deb`/`.rpm` packages (Debian 13, Ubuntu 24.04/25.x, Fedora 42) since no distro packages exist — see [Cagebreak Setup](../compositors/cagebreak).
 
+### Void Linux (.xbps)
+
+Download matching sysc-greet and gSlapper packages for x86_64 glibc or musl and follow the [native XBPS instructions](../getting-started/void-linux#native-xbps-packages). The packages use `/usr/bin/sysc-greet` and `/etc/greetd/sysc-greet/`; configure greetd and enable its runit service after installation.
+
 ### Switching Compositors
 
-The package auto-detects your compositor during installation. If you have multiple compositors installed or want to switch to a different one, edit `/etc/greetd/config.toml`:
+The Debian and Fedora packages auto-detect your compositor during installation. If you have multiple compositors installed or want to switch to a different one, edit `/etc/greetd/config.toml`:
 
 ```bash
 sudo nano /etc/greetd/config.toml
@@ -192,11 +215,15 @@ All compositor configs are installed at `/etc/greetd/`. Save the file and reboot
 ### Add to configuration.nix
 
 ```nix
+{ lib, ... }:
 {
   services.sysc-greet = {
     enable = true;
     compositor = "niri";  # or "cagebreak", "sway", "mango", "hyprland" (0.55+)
   };
+
+  # Required for the CC BY-NC model assets included through sysc-Go.
+  nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "sysc-greet" ];
 
   # Optional: Set initial session for auto-login
   services.sysc-greet.settings.initial_session = {
@@ -205,6 +232,8 @@ All compositor configs are installed at `/etc/greetd/`. Save the file and reboot
   };
 }
 ```
+
+sysc-greet's own source code remains GPL-3.0-only. This package-specific exception covers the current binary's sysc-Go model assets; the module uses your system's Nixpkgs license policy.
 
 By default, the NixOS module does not install `niri`, `cagebreak`, `hyprland`, `sway`, or `mango`.
 Install your chosen backend yourself, or set `niriPackage`, `cagebreakPackage`, `hyprlandPackage`,
@@ -318,6 +347,11 @@ sudo apt remove sysc-greet
 **Fedora:**
 ```bash
 sudo dnf remove sysc-greet
+```
+
+**Void Linux:**
+```bash
+sudo xbps-remove sysc-greet
 ```
 
 ### Arch Linux (AUR)
